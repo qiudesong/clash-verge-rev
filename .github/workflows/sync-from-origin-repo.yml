@@ -1,0 +1,122 @@
+name: Sync from Other Repository
+
+on:
+  schedule:
+    # 每天 UTC 时间 02:00 执行（可根据需要调整）
+    # 格式：分钟 小时 日 月 星期
+    # 例如：每天凌晨 2 点 = "0 2 * * *"
+    # 例如：每周一凌晨 2 点 = "0 2 * * 1"
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    # 允许手动触发
+    inputs:
+      source_repo:
+        description: 'Source repository (owner/repo)'
+        required: true
+        default: 'clash-verge-rev/clash-verge-rev'
+      source_branch:
+        description: 'clash-verge-rev/clash-verge-rev'
+        required: true
+        default: 'main'
+      target_branch:
+        description: 'Target branch name (defaults to source_branch)'
+        required: false
+        default: ''
+
+env:
+  # 配置源仓库信息（可通过 workflow_dispatch 或环境变量覆盖）
+  SOURCE_REPO: ${{ github.event.inputs.source_repo || 'clash-verge-rev/clash-verge-rev' }}
+  SOURCE_BRANCH: ${{ github.event.inputs.source_branch || 'main' }}
+  TARGET_BRANCH: ${{ github.event.inputs.target_branch || github.event.inputs.source_branch || 'main' }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    
+    steps:
+      - name: Checkout current repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+          ref: ${{ env.TARGET_BRANCH }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add source repository as remote
+        run: |
+          git remote add source https://github.com/${{ env.SOURCE_REPO }}.git || true
+          git remote set-url source https://github.com/${{ env.SOURCE_REPO }}.git
+
+      - name: Fetch from source repository
+        run: |
+          git fetch source ${{ env.SOURCE_BRANCH }}:${{ env.SOURCE_BRANCH }}-source
+
+      - name: Check if merge is needed
+        id: check_merge
+        run: |
+          CURRENT_COMMIT=$(git rev-parse HEAD)
+          SOURCE_COMMIT=$(git rev-parse ${{ env.SOURCE_BRANCH }}-source)
+          
+          if [ "$CURRENT_COMMIT" = "$SOURCE_COMMIT" ]; then
+            echo "no_merge=true" >> $GITHUB_OUTPUT
+            echo "No merge needed - branches are already in sync"
+          else
+            echo "no_merge=false" >> $GITHUB_OUTPUT
+            echo "Merge needed - branches differ"
+          fi
+
+      - name: Merge from source branch
+        if: steps.check_merge.outputs.no_merge == 'false'
+        run: |
+          git merge ${{ env.SOURCE_BRANCH }}-source --no-edit -m "chore: sync from ${{ env.SOURCE_REPO }}/${{ env.SOURCE_BRANCH }}"
+        continue-on-error: true
+
+      - name: Handle merge conflicts
+        if: steps.check_merge.outputs.no_merge == 'false' && failure()
+        run: |
+          echo "Merge conflict detected. Please resolve manually."
+          git status
+          exit 1
+
+      - name: Push changes
+        if: steps.check_merge.outputs.no_merge == 'false' && success()
+        run: |
+          git push origin ${{ env.TARGET_BRANCH }}
+
+      - name: Create Pull Request (if conflicts)
+        if: steps.check_merge.outputs.no_merge == 'false' && failure()
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: sync-from-${{ env.SOURCE_REPO }}-${{ github.run_number }}
+          title: "Sync from ${{ env.SOURCE_REPO }}/${{ env.SOURCE_BRANCH }} (Conflicts detected)"
+          body: |
+            This PR was created automatically due to merge conflicts during sync.
+            
+            Source: `${{ env.SOURCE_REPO }}@${{ env.SOURCE_BRANCH }}`
+            Target: `${{ env.TARGET_BRANCH }}`
+            
+            Please resolve conflicts manually and merge.
+          commit-message: "chore: sync from ${{ env.SOURCE_REPO }}/${{ env.SOURCE_BRANCH }} (conflicts)"
+          labels: |
+            automated
+            sync
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ "${{ steps.check_merge.outputs.no_merge }}" = "true" ]; then
+            echo "✅ Branches are already in sync. No action needed."
+          elif [ "${{ job.status }}" = "success" ]; then
+            echo "✅ Successfully merged and pushed changes from ${{ env.SOURCE_REPO }}/${{ env.SOURCE_BRANCH }}"
+          else
+            echo "⚠️ Merge conflicts detected. A PR has been created for manual resolution."
+          fi
+
